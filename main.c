@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <time.h>
 
 #define NUM_CASILLAS 26
 #define VACIO 0
@@ -32,11 +33,49 @@ typedef struct {
     pthread_mutex_t lock_juez;
     int ganador;
     bool activa;
+    pthread_t fichas_tid[13];
 } Mesa;
+
+typedef struct {
+    Mesa* mesa;
+    int tipo;
+    int id_ficha;
+} FichaArgs;
 
 void manejador_sigint(int sig) {
     (void)sig; 
     torneo_activo = 0;
+}
+
+void* hilo_ficha(void* arg) {
+    FichaArgs* args = (FichaArgs*)arg;
+    Mesa* mesa = args->mesa;
+    
+    while (mesa->activa && mesa->ganador == 0) {
+        usleep((rand() % 251 + 50) * 1000);
+        
+        pthread_mutex_lock(&mesa->tablero.lock);
+        
+        if (!mesa->activa || mesa->ganador != 0) {
+            pthread_mutex_unlock(&mesa->tablero.lock);
+            break;
+        }
+        
+        int jugada_ganadora = rand() % 100;
+        if (jugada_ganadora < 5) {
+            pthread_mutex_lock(&mesa->lock_juez);
+            if (mesa->ganador == 0) {
+                mesa->ganador = args->tipo;
+                pthread_cond_signal(&mesa->cv_juez);
+            }
+            pthread_mutex_unlock(&mesa->lock_juez);
+        }
+        
+        pthread_mutex_unlock(&mesa->tablero.lock);
+    }
+    
+    free(args);
+    return NULL;
 }
 
 void* hilo_juez(void* arg) {
@@ -49,6 +88,12 @@ void* hilo_juez(void* arg) {
     pthread_mutex_unlock(&mesa->lock_juez);
     
     printf("Mesa %d finalizada. Ganador: %d\n", mesa->id_mesa, mesa->ganador);
+    
+    mesa->activa = false;
+    
+    for (int i = 0; i < 13; i++) {
+        pthread_join(mesa->fichas_tid[i], NULL);
+    }
     
     pthread_mutex_destroy(&mesa->tablero.lock);
     pthread_mutex_destroy(&mesa->lock_juez);
@@ -93,17 +138,18 @@ void* conexion_jugador(void* arg) {
 
         printf("Mesa %d asignada.\n", mi_mesa);
 
+        for (int i = 0; i < 13; i++) {
+            FichaArgs* f_args = malloc(sizeof(FichaArgs));
+            f_args->mesa = nueva_mesa;
+            f_args->id_ficha = i;
+            f_args->tipo = (i == 0) ? PUMA : PERRO;
+            pthread_create(&nueva_mesa->fichas_tid[i], NULL, hilo_ficha, f_args);
+        }
+
         pthread_t juez_tid;
         pthread_create(&juez_tid, NULL, hilo_juez, nueva_mesa);
         
-        sleep(2);
-        
-        pthread_mutex_lock(&nueva_mesa->lock_juez);
-        nueva_mesa->ganador = PUMA;
-        pthread_cond_signal(&nueva_mesa->cv_juez);
-        pthread_mutex_unlock(&nueva_mesa->lock_juez);
-
-        pthread_detach(juez_tid);
+        pthread_join(juez_tid, NULL);
 
     } else {
         pthread_mutex_unlock(&lock_matchmaker);
@@ -123,6 +169,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    srand(time(NULL));
     sem_init(&mesas_disponibles, 0, M);
 
     struct sigaction sa;
