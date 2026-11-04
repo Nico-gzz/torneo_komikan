@@ -33,6 +33,8 @@ typedef struct {
     pthread_mutex_t lock_juez;
     int ganador;
     bool activa;
+    int perros_capturados;
+    int pos_puma;
     pthread_t fichas_tid[13];
 } Mesa;
 
@@ -40,11 +42,59 @@ typedef struct {
     Mesa* mesa;
     int tipo;
     int id_ficha;
+    int pos_actual;
 } FichaArgs;
 
 void manejador_sigint(int sig) {
     (void)sig; 
     torneo_activo = 0;
+}
+
+bool es_adyacente(int o, int d) {
+    if (o < 0 || o > 25 || d < 0 || d > 25 || o == d) return false;
+    if (o == 25) return (d == 1 || d == 2 || d == 3);
+    if (d == 25) return (o == 1 || o == 2 || o == 3);
+    
+    int ox = o % 5, oy = o / 5;
+    int dx = d % 5, dy = d / 5;
+    
+    int dist_x = abs(ox - dx);
+    int dist_y = abs(oy - dy);
+    
+    if (dist_x > 1 || dist_y > 1) return false;
+    if ((ox + oy) % 2 != 0 && dist_x == 1 && dist_y == 1) return false;
+    
+    return true;
+}
+
+int nodo_intermedio(int o, int d) {
+    if (o == 25 || d == 25) return -1; 
+    
+    int ox = o % 5, oy = o / 5;
+    int dx = d % 5, dy = d / 5;
+    
+    if (abs(ox - dx) == 0 && abs(oy - dy) == 2) return o + ((dy - oy) / 2) * 5;
+    if (abs(oy - dy) == 0 && abs(ox - dx) == 2) return o + (dx - ox) / 2;
+    if (abs(ox - dx) == 2 && abs(oy - dy) == 2) {
+        if ((ox + oy) % 2 == 0) return o + ((dx - ox) / 2) + ((dy - oy) / 2) * 5;
+    }
+    return -1;
+}
+
+bool puma_sin_movimientos(Mesa* mesa) {
+    int o = mesa->pos_puma;
+    for (int d = 0; d < 26; d++) {
+        if (mesa->tablero.casillas[d] == VACIO && es_adyacente(o, d)) {
+            return false;
+        }
+        if (mesa->tablero.casillas[d] == VACIO) {
+            int mid = nodo_intermedio(o, d);
+            if (mid != -1 && mesa->tablero.casillas[mid] == PERRO) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void* hilo_ficha(void* arg) {
@@ -60,18 +110,61 @@ void* hilo_ficha(void* arg) {
             pthread_mutex_unlock(&mesa->tablero.lock);
             break;
         }
-        
-        int jugada_ganadora = rand() % 100;
-        if (jugada_ganadora < 5) {
+
+        int posibles[26];
+        int num_posibles = 0;
+        int es_captura[26];
+
+        for (int d = 0; d < 26; d++) {
+            if (mesa->tablero.casillas[d] == VACIO) {
+                if (es_adyacente(args->pos_actual, d)) {
+                    es_captura[num_posibles] = -1;
+                    posibles[num_posibles++] = d;
+                } else if (args->tipo == PUMA) {
+                    int mid = nodo_intermedio(args->pos_actual, d);
+                    if (mid != -1 && mesa->tablero.casillas[mid] == PERRO) {
+                        es_captura[num_posibles] = mid;
+                        posibles[num_posibles++] = d;
+                    }
+                }
+            }
+        }
+
+        if (num_posibles > 0) {
+            int idx = rand() % num_posibles;
+            int destino = posibles[idx];
+            int captura = es_captura[idx];
+
+            mesa->tablero.casillas[args->pos_actual] = VACIO;
+            mesa->tablero.casillas[destino] = args->tipo;
+            args->pos_actual = destino;
+
+            if (args->tipo == PUMA) {
+                mesa->pos_puma = destino;
+                if (captura != -1) {
+                    mesa->tablero.casillas[captura] = VACIO;
+                    mesa->perros_capturados++;
+                }
+            }
+
             pthread_mutex_lock(&mesa->lock_juez);
             if (mesa->ganador == 0) {
-                mesa->ganador = args->tipo;
-                pthread_cond_signal(&mesa->cv_juez);
+                if (mesa->perros_capturados >= 6) {
+                    mesa->ganador = PUMA;
+                    pthread_cond_signal(&mesa->cv_juez);
+                } else if (args->tipo == PERRO && puma_sin_movimientos(mesa)) {
+                    mesa->ganador = PERRO;
+                    pthread_cond_signal(&mesa->cv_juez);
+                }
             }
             pthread_mutex_unlock(&mesa->lock_juez);
         }
-        
+
         pthread_mutex_unlock(&mesa->tablero.lock);
+        
+        if (args->tipo == PERRO && args->pos_actual == -1) {
+            break;
+        }
     }
     
     free(args);
@@ -87,7 +180,7 @@ void* hilo_juez(void* arg) {
     }
     pthread_mutex_unlock(&mesa->lock_juez);
     
-    printf("Mesa %d finalizada. Ganador: %d\n", mesa->id_mesa, mesa->ganador);
+    printf("Mesa %d finalizada. Ganador: %d (Capturas: %d)\n", mesa->id_mesa, mesa->ganador, mesa->perros_capturados);
     
     mesa->activa = false;
     
@@ -127,6 +220,8 @@ void* conexion_jugador(void* arg) {
         nueva_mesa->id_mesa = mi_mesa;
         nueva_mesa->activa = true;
         nueva_mesa->ganador = 0;
+        nueva_mesa->perros_capturados = 0;
+        nueva_mesa->pos_puma = 25;
         
         pthread_mutex_init(&nueva_mesa->tablero.lock, NULL);
         pthread_mutex_init(&nueva_mesa->lock_juez, NULL);
@@ -136,13 +231,28 @@ void* conexion_jugador(void* arg) {
             nueva_mesa->tablero.casillas[i] = VACIO;
         }
 
+        int pos_iniciales_perros[12] = {13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
+        
+        nueva_mesa->tablero.casillas[25] = PUMA;
+        for (int i = 0; i < 12; i++) {
+            nueva_mesa->tablero.casillas[pos_iniciales_perros[i]] = PERRO;
+        }
+
         printf("Mesa %d asignada.\n", mi_mesa);
 
         for (int i = 0; i < 13; i++) {
             FichaArgs* f_args = malloc(sizeof(FichaArgs));
             f_args->mesa = nueva_mesa;
             f_args->id_ficha = i;
-            f_args->tipo = (i == 0) ? PUMA : PERRO;
+            
+            if (i == 0) {
+                f_args->tipo = PUMA;
+                f_args->pos_actual = 25;
+            } else {
+                f_args->tipo = PERRO;
+                f_args->pos_actual = pos_iniciales_perros[i - 1];
+            }
+            
             pthread_create(&nueva_mesa->fichas_tid[i], NULL, hilo_ficha, f_args);
         }
 
